@@ -1,4 +1,4 @@
-import { fetchFeatures, createFeature, updateFeature, fetchMe, assignUserRole } from './api.js';
+import { fetchFeatures, createFeature, updateFeature, fetchMe, assignUserRole, createFeaturesBulk } from './api.js';
 import { initLeafletMap, renderMap, flyToFeature, enableMapPicker, toggleLayer, fetchAmenities, map, switchBasemap, toggleOverlay, startLineDrawing } from './map.js';
 import { updateInfoCard, renderLegend, initThemeToggle, openModal, closeModal, openHelpModal, closeHelpModal, switchTab } from './ui.js';
 import { downloadGeoJSON, getCategoryMeta } from './utils.js';
@@ -48,9 +48,13 @@ function hasPermission(p) {
   return userPermissions.includes(p);
 }
 
+function isUserStaff() {
+  return hasPermission('feature.any.hide') || hasPermission('feature.any.update_public_fields') || hasPermission('user.role.assign');
+}
+
 function updateAdminUI() {
   const isAdmin = hasPermission('user.role.assign');
-  const isStaff = hasPermission('feature.any.hide') || hasPermission('feature.any.update_public_fields');
+  const isStaff = isUserStaff();
 
   if (currentUser) {
     if (adminAuthRequired) adminAuthRequired.style.display = 'none';
@@ -76,7 +80,7 @@ function updateAdminUI() {
 async function refreshData() {
   try {
     allFeatures = await fetchFeatures();
-    const isStaff = hasPermission('feature.any.hide') || hasPermission('feature.any.update_public_fields') || hasPermission('user.role.assign');
+    const isStaff = isUserStaff();
     renderMap(allFeatures, allFeatures.length, (f) => updateInfoCard(f, infoCard, isStaff), handleMarkerDrag, isStaff);
     renderLegend(allFeatures, legendStack, (f) => flyToFeature(f, (feature) => updateInfoCard(feature, infoCard, isStaff)));
   } catch (err) {
@@ -128,17 +132,17 @@ async function init() {
     });
   }
   
-  await checkUserAuth();
   await refreshData();
   initCryptAnimations();
 
   const searchResultsList = document.getElementById('searchResultsList');
 
   let searchTimeout;
+  let nominatimController = null;
   if (searchInput) {
     searchInput.addEventListener('input', (e) => {
       const q = e.target.value.toLowerCase();
-      const isStaff = hasPermission('feature.any.hide') || hasPermission('feature.any.update_public_fields') || hasPermission('user.role.assign');
+      const isStaff = isUserStaff();
 
       if (!q) {
         if (searchResultsList) searchResultsList.innerHTML = '';
@@ -166,8 +170,13 @@ async function init() {
           });
 
           try {
-            const nomResp = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5&viewbox=-95.1,39.3,-94.1,38.7&bounded=1`);
+            if (nominatimController) {
+              nominatimController.abort();
+            }
+            nominatimController = new AbortController();
+            const nomResp = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5&viewbox=-95.1,39.3,-94.1,38.7&bounded=1`, { signal: nominatimController.signal });
             const nomData = await nomResp.json();
+            nominatimController = null;
             
             if (nomData.length > 0) {
               const divider = document.createElement('div');
@@ -187,7 +196,9 @@ async function init() {
               });
             }
           } catch (err) {
-            console.warn('Nominatim search failed:', err);
+            if (err.name !== 'AbortError') {
+              console.warn('Nominatim search failed:', err);
+            }
           }
         }
 
@@ -229,6 +240,8 @@ async function init() {
   // Basemap Selector
   const basemapSelect = document.getElementById('basemapSelect');
   const saveDefaultBasemapBtn = document.getElementById('saveDefaultBasemapBtn');
+
+  await checkUserAuth();
 
   async function checkUserAuth() {
     try {
@@ -306,12 +319,16 @@ async function init() {
       try {
         sendMagicLinkBtn.disabled = true;
         sendMagicLinkBtn.textContent = 'Sending...';
-        await fetch('/auth/login', {
+        const res = await fetch('/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email })
         });
-        alert('Verification link sent! Check your inbox.');
+        if (res.ok) {
+            alert('Verification link sent! Check your inbox.');
+        } else {
+            throw new Error(`Server returned ${res.status}`);
+        }
       } catch (err) {
         alert('Failed to send link: ' + err.message);
       } finally {
@@ -331,7 +348,7 @@ async function init() {
   const geoJsonFileInput = document.getElementById('geoJsonFileInput');
 
   if (importGeoJsonBtn && geoJsonFileInput) {
-    importGeoJsonBtn.addEventListener('click', () => geoJsonFileInput.click());
+    importGeoJsonBtn.addEventListener('click', () => { if (!hasPermission('feature.import_official')) return alert('Unauthorized'); geoJsonFileInput.click(); });
     geoJsonFileInput.addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
@@ -345,6 +362,7 @@ async function init() {
           importGeoJsonBtn.disabled = true;
           importGeoJsonBtn.textContent = 'Importing...';
           
+          const featuresToImport = [];
           for (const feat of geojson.features) {
             const geom = feat.geometry;
             const props = feat.properties || {};
@@ -360,16 +378,15 @@ async function init() {
               public_description: props.public_description || '',
               geometry: geom
             };
-            
-            try {
-              await createFeature(data);
-              count++;
-            } catch (err) {
-              console.warn("Failed import:", data.name, err);
-            }
+            featuresToImport.push(data);
           }
-          alert(`Imported ${count} features.`);
-          await refreshData();
+          try {
+            const res = await createFeaturesBulk(featuresToImport);
+            alert(`Imported ${res.count} features.`);
+            await refreshData();
+          } catch (err) {
+             alert("Error: " + err.message);
+          }
         } catch (err) {
           alert("Error: " + err.message);
         } finally {
@@ -388,7 +405,9 @@ async function init() {
       try {
         importMarcBtn.disabled = true;
         importMarcBtn.textContent = 'Importing...';
-        const resp = await fetch('/admin/import-marc');
+        const resp = await fetch('/admin/import-marc', {
+            method: 'POST'
+        });
         const result = await resp.text();
         alert(result);
         await refreshData();
