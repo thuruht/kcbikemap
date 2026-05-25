@@ -1,4 +1,4 @@
-import { Env } from '../../src/index';
+import type { Env } from '../../src/index.js';
 
 /**
  * Script to import MARC Regional Trails data into D1.

@@ -16,6 +16,18 @@ export async function createFeature(data) {
   return await res.json();
 }
 
+export async function createFeaturesBulk(features) {
+  const res = await fetch('/api/features/bulk', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ features })
+  });
+  if (!res.ok) throw new Error('Failed to create features bulk');
+  return await res.json();
+}
+
 export async function updateFeature(id, data) {
   const res = await fetch(`/api/features/${id}`, {
     method: 'PUT',

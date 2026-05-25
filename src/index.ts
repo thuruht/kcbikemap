@@ -1,4 +1,4 @@
-import { D1Database, Fetcher, R2Bucket } from "@cloudflare/workers-types";
+import type { D1Database, Fetcher, R2Bucket, KVNamespace } from "@cloudflare/workers-types";
 
 export interface Env {
   DB: D1Database;
@@ -88,7 +88,7 @@ const RBAC_SCHEMA: Record<string, string[]> = {
 };
 
 function hasPermission(role: string, permission: string): boolean {
-  const perms = RBAC_SCHEMA[role] || RBAC_SCHEMA["public"];
+  const perms = RBAC_SCHEMA[role] || RBAC_SCHEMA["public"] || [];
   return perms.includes(permission);
 }
 
@@ -107,13 +107,13 @@ export default {
     }
 
     // Serve static assets with CSP
-    const response = await env.ASSETS.fetch(request);
-    const newHeaders = new Headers(response.headers);
+    const response = await env.ASSETS.fetch(request as any);
+    const newHeaders = new Headers(response.headers as any);
     // Relaxed CSP to allow internal scripts, Leaflet, GSAP, and Cloudflare Analytics
     const csp = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://unpkg.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://*.tile.openstreetmap.org https://*.basemaps.cartocdn.com https://unpkg.com https://tiles.stadiamaps.com https://*.tile.opentopomap.org https://*.vis.earthdata.nasa.gov https://*.arcgisonline.com https://*.tile-cyclosm.openstreetmap.fr https://mt1.google.com https://*.tile.thunderforest.com https://*.tile.openstreetmap.fr https://tile.osm.ch https://tile.memomaps.de https://*.tiles.openrailwaymap.org https://tile.waymarkedtrails.org; connect-src 'self' https://overpass-api.de https://overpass.osm.ch https://nominatim.openstreetmap.org https://cloudflareinsights.com https://*.cloudflareinsights.com;";
     newHeaders.set("Content-Security-Policy", csp);
     
-    return new Response(response.body, {
+    return new Response(response.body as any, {
       status: response.status,
       statusText: response.statusText,
       headers: newHeaders
@@ -156,12 +156,42 @@ async function handleAuthRequest(request: Request, env: Env, url: URL): Promise<
       console.error("Email Sending failed:", err.message);
       // Fallback log for dev visibility
       console.log(`EMERGENCY ACCESS LINK: ${loginUrl}`);
-      return jsonResponse({ error: "Failed to send email", link: loginUrl }, 500);
+      return jsonResponse({ error: "Failed to send email" }, 500);
     }
   }
 
   if (method === "GET" && path === "verify") {
-    // ... verification logic ...
+    const token = url.searchParams.get("token");
+    if (!token) {
+        return new Response("Missing token", { status: 400 });
+    }
+    const record = await env.DB.prepare("SELECT * FROM auth_tokens WHERE token = ? AND expires_at > datetime('now')").bind(token).first();
+    if (!record) {
+        return new Response("Invalid or expired token", { status: 400 });
+    }
+    const email = record.email as string;
+
+    await env.DB.prepare("DELETE FROM auth_tokens WHERE token = ?").bind(token).run();
+
+    let user = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+    if (!user) {
+        await env.DB.prepare("INSERT INTO users (email) VALUES (?)").bind(email).run();
+        user = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+    }
+
+    const sessionId = crypto.randomUUID();
+    const sessionToken = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+    await env.DB.prepare("INSERT INTO sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)")
+        .bind(sessionId, user!.id, sessionToken, expiresAt).run();
+
+    return new Response(null, {
+        status: 302,
+        headers: {
+            "Location": "/",
+            "Set-Cookie": `session=${sessionId}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${7 * 24 * 60 * 60}`
+        }
+    });
   }
 
   if (method === "POST" && path === "logout") {
@@ -276,12 +306,12 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
       
       if (session) {
         user = session;
-        role = session.role || "user";
+        role = (session as any).role || "user";
       }
     }
 
     // 2. Admin: MARC Import
-    if (fullPath === "/admin/import-marc") {
+    if (method === "POST" && fullPath === "/admin/import-marc") {
       if (!hasPermission(role, "feature.import_official")) {
         return new Response("Unauthorized", { status: 401 });
       }
@@ -300,6 +330,41 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
         .bind(newRole, email).run();
       
       return jsonResponse({ success: true });
+    }
+
+    if (method === "POST" && path === "features/bulk") {
+        if (!hasPermission(role, "feature.import_official")) {
+            return new Response("Unauthorized", { status: 401 });
+        }
+        const body = await request.json() as any;
+        const features = body.features;
+        if (!features || !Array.isArray(features)) {
+            return new Response("Invalid request body", { status: 400 });
+        }
+        let importedCount = 0;
+        const batchSize = 50;
+        for (let i = 0; i < features.length; i += batchSize) {
+            const chunk = features.slice(i, i + batchSize);
+            const statements: any[] = [];
+            for (const feature of chunk) {
+                const id = crypto.randomUUID();
+                const slug = feature.slug || feature.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-" + Math.random().toString(36).slice(2, 5);
+                statements.push(env.DB.prepare(`
+                  INSERT INTO features (id, slug, name, feature_type, category, status, visibility, officiality, public_description, surface_note, risk_note, weather_sensitivity, source_confidence, longevity, owner_id)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `).bind(id, slug, feature.name || 'Unnamed', feature.feature_type || 'point', feature.category || 'Local Knowledge', feature.status || 'active',
+                  feature.visibility || 'public', feature.officiality || 'unofficial', feature.public_description || null, feature.surface_note || null,
+                  feature.risk_note || null, feature.weather_sensitivity || 'none', feature.source_confidence || 'medium', feature.longevity || 'permanent',
+                  user?.id || null));
+                statements.push(env.DB.prepare("INSERT INTO feature_geometries (feature_id, public_geometry) VALUES (?, ?)")
+                  .bind(id, JSON.stringify(feature.geometry || null)));
+            }
+            if (statements.length > 0) {
+                await env.DB.batch(statements);
+                importedCount += chunk.length;
+            }
+        }
+        return jsonResponse({ success: true, count: importedCount });
     }
 
     // 4. Moderation: Hide Feature/Comment
@@ -325,9 +390,9 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
         SELECT b.* FROM badges b
         JOIN user_badges ub ON b.id = ub.badge_id
         WHERE ub.user_id = ?
-      `).bind(user.user_id).all();
+      `).bind(user.id).all();
 
-      const prefsRaw = await env.KV.get(`prefs:${user.user_id}`);
+      const prefsRaw = await env.KV.get(`prefs:${user.id}`);
       const preferences = prefsRaw ? JSON.parse(prefsRaw) : {};
 
       return jsonResponse({
@@ -363,7 +428,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
 
       await env.DB.prepare(`
         UPDATE users SET username = ?, bio = ?, social_links = ? WHERE id = ?
-      `).bind(username || null, bio || null, social_links ? JSON.stringify(social_links) : null, user.user_id).run();
+      `).bind(username || null, bio || null, social_links ? JSON.stringify(social_links) : null, user.id).run();
 
       return jsonResponse({ success: true });
     }
@@ -377,29 +442,29 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
       if (!file) return new Response("No file uploaded", { status: 400 });
 
       const ext = file.name.split('.').pop() || 'png';
-      const filename = `${user.user_id}-${Date.now()}.${ext}`;
+      const filename = `${user.id}-${Date.now()}.${ext}`;
 
       // Upload to R2
-      await env.AVATARS_BUCKET.put(filename, file.stream(), {
+      await env.AVATARS_BUCKET.put(filename, file.stream() as any, {
         httpMetadata: { contentType: file.type }
       });
 
       const avatar_url = `/api/avatars/${filename}`; // Or custom domain
 
-      await env.DB.prepare("UPDATE users SET avatar_url = ? WHERE id = ?").bind(avatar_url, user.user_id).run();
+      await env.DB.prepare("UPDATE users SET avatar_url = ? WHERE id = ?").bind(avatar_url, user.id).run();
 
       return jsonResponse({ success: true, avatar_url });
     }
 
     if (method === "GET" && path.startsWith("avatars/")) {
       const filename = path.split("/")[1];
-      const object = await env.AVATARS_BUCKET.get(filename);
+      const object = await env.AVATARS_BUCKET.get(filename as string);
       if (!object) return new Response("Not found", { status: 404 });
       
-      const headers = new Headers();
-      object.writeHttpMetadata(headers);
-      headers.set("etag", object.httpEtag);
-      return new Response(object.body, { headers });
+      const headers = new Headers() as any;
+      object.writeHttpMetadata(headers as any);
+      headers.set("etag", object.httpEtag as string);
+      return new Response(object.body as any, { headers });
     }
 
     if (method === "GET" && path.startsWith("profiles/")) {
@@ -445,7 +510,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     if (method === "POST" && path === "me/preferences") {
       if (!user) return new Response("Unauthorized", { status: 401 });
       const body = await request.json();
-      await env.KV.put(`prefs:${user.user_id}`, JSON.stringify(body));
+      await env.KV.put(`prefs:${user.id}`, JSON.stringify(body));
       return jsonResponse({ success: true });
     }
 
@@ -514,7 +579,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
     }
 
     if (method === "POST" && path === "features") {
-      if (!hasPermission(role, "feature.own.create")) return new Response("Unauthorized", { status: 401 });
+      if (!user && !hasPermission(role, "feature.own.create")) return new Response("Unauthorized", { status: 401 });
       
       const body = await request.json() as any;
       if (!body.name) return new Response("Name is required", { status: 400 });
@@ -529,7 +594,7 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
       `).bind(id, slug, body.name || 'Unnamed', body.feature_type || 'point', body.category || 'Local Knowledge', body.status || 'active', 
         body.visibility || 'public', body.officiality || 'unofficial', body.public_description || null, body.surface_note || null,
         body.risk_note || null, body.weather_sensitivity || 'none', body.source_confidence || 'medium', body.longevity || 'permanent', 
-        body.poster_email || null, deleteToken, user?.user_id || null).run();
+        body.poster_email || null, deleteToken, user?.id || null).run();
 
       await env.DB.prepare("INSERT INTO feature_geometries (feature_id, public_geometry) VALUES (?, ?)")
         .bind(id, JSON.stringify(body.geometry || null)).run();
@@ -548,9 +613,9 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
       const id = path.split("/")[1];
       const body = await request.json() as any;
       
-      const feature = await env.DB.prepare("SELECT owner_id FROM features WHERE id = ?").bind(id).first() as { owner_id: string } | null;
+      const feature = await env.DB.prepare("SELECT owner_id, visibility FROM features WHERE id = ?").bind(id).first() as { owner_id: string, visibility: string } | null;
       
-      const isOwner = user && feature?.owner_id === user.user_id;
+      const isOwner = user && feature?.owner_id === user.id;
       const canEditAny = hasPermission(role, "feature.any.update");
       const canEditPublic = hasPermission(role, "feature.any.update_public_fields");
 
@@ -561,8 +626,8 @@ async function handleApiRequest(request: Request, env: Env, url: URL): Promise<R
       // If only canEditPublic, we must restrict what fields are updated
       // For now, simplicity: moderators can edit most things, but not visibility if it's toggle-restricted
       if (canEditPublic && !canEditAny && !isOwner) {
-        if (body.visibility && body.visibility !== feature?.owner_id) { // This check is weak, but placeholder for policy
-           // Add logic for redact_public vs toggle
+        if (body.visibility && body.visibility !== feature?.visibility) {
+           return new Response("Moderators cannot change visibility", { status: 403 });
         }
       }
 
@@ -612,7 +677,8 @@ function jsonResponse(data: any, status = 200): Response {
     status,
     headers: { 
       "Content-Type": "application/json", 
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": "https://jojomap.kcmo.xyz",
+      "Access-Control-Allow-Credentials": "true",
     },
   });
 }
